@@ -1,0 +1,6 @@
+Revision history for Perl extension Math::Packed.
+
+0.01  Sun Jan 17 16:38:47 2010
+	- original version; created by h2xs 1.23 with options
+		-An Math::Packed
+

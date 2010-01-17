@@ -1,0 +1,8 @@
+Changes
+Makefile.PL
+MANIFEST
+Packed.xs
+ppport.h
+README
+t/Math-Packed.t
+lib/Math/Packed.pm
