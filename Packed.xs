@@ -6,15 +6,6 @@
 
 #include "ppport.h"
 
-static char *
-make_dest(SV *t, STRLEN len) {
-    char *tp = SvGROW(t, len + 1);
-    SvPOK_on(t);
-    SvCUR_set(t, len);
-    tp[len] = '\0';
-    return tp;
-}
-
 #define BITOP_AND   1
 #define BITOP_OR    2
 #define BITOP_XOR   3
@@ -27,8 +18,48 @@ make_dest(SV *t, STRLEN len) {
 #define BITOP_NIMP  9
 #define BITOP_NPMI 10
 
+typedef struct vtable_ {
+    char packer;
+    STRLEN size;
+    void (*bvgrep)(char **ap, char *bvp, char **tp,
+		   STRLEN al, STRLEN bvl, STRLEN tl);
+} vtable;
+
 static void
-iv_and(IV *a, IV *b, IV* t, IV *btop) {
+bvgrep_uv(char *ap, char *bvp, char *tp,
+	  STRLEN *al, STRLEN bvl, STRLEN *tl) {
+    UV *api = (UV*)*ap;
+    UV *tpi = (UV*)*tp;
+    for (; api < atopi; api++) {
+	UV uv = *api;
+	int bit = uv & 7;
+	STRLEN byte = uv >> 3;
+	if (byte < bvl && ((bvp[byte] >> bit) & 1)) {
+	    if (tpi < ttopi)
+		*tpi++ = uv;
+	    else break;
+	}
+    }
+    *ap = (char*)api;
+    *tp = (char*)tpi;
+}
+
+static vtable vtable_J = { 'J',
+			   sizeof(UV),
+			   &bvgrep_uv, };
+
+static vtable *
+find_vtable(char packer) {
+    switch (packer) {
+    case 'J':
+	return &vtable_J;
+    default:
+	croak("unsupported packed '%c'", packer);
+    }
+}
+
+static void
+uv_and(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = *a++ & *b++;
 }
 
@@ -38,7 +69,7 @@ char_and(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_or(IV *a, IV *b, IV* t, IV *btop) {
+uv_or(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = *a++ | *b++;
 }
 
@@ -48,7 +79,7 @@ char_or(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_xor(IV *a, IV *b, IV* t, IV *btop) {
+uv_xor(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = *a++ ^ *b++;
 }
 
@@ -58,7 +89,7 @@ char_xor(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_imp(IV *a, IV *b, IV* t, IV *btop) {
+uv_imp(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = ~*a++ | *b++;
 }
 
@@ -68,7 +99,7 @@ char_imp(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_pmi(IV *a, IV *b, IV* t, IV *btop) {
+uv_pmi(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = *a++ | ~*b++;
 }
 
@@ -78,7 +109,7 @@ char_pmi(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_nand(IV *a, IV *b, IV* t, IV *btop) {
+uv_nand(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = ~(*a++ & *b++);
 }
 
@@ -88,7 +119,7 @@ char_nand(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_nor(IV *a, IV *b, IV* t, IV *btop) {
+uv_nor(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = ~(*a++ | *b++);
 }
 
@@ -98,7 +129,7 @@ char_nor(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_nxor(IV *a, IV *b, IV* t, IV *btop) {
+uv_nxor(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = ~(*a++ ^ *b++);
 }
 
@@ -108,7 +139,7 @@ char_nxor(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_nimp(IV *a, IV *b, IV* t, IV *btop) {
+uv_nimp(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = *a++ & ~*b++;
 }
 
@@ -118,7 +149,7 @@ char_nimp(char *a, char *b, char *t, char *btop) {
 }
 
 static void
-iv_npmi(IV *a, IV *b, IV* t, IV *btop) {
+uv_npmi(UV *a, UV *b, UV* t, UV *btop) {
     while (b < btop) *t++ = ~*a++ & *b++;
 }
 
@@ -127,12 +158,34 @@ char_npmi(char *a, char *b, char *t, char *btop) {
     while (b < btop) *t++ = ~*a++ & *b++;
 }
 
+static char *
+make_dest(SV *t, STRLEN len, int discard_old) {
+    char *tp;
+    SvUPGRADE(t, SVt_PV);
+    if (discard_old || !SvPOK(t)) {
+	SvPOK_on(t);
+	SvCUR_set(t, 0);
+	SvOOK_off(t);
+    }
+    tp = SvGROW(t, len + 1);
+    return tp;
+}
+
+static void
+check_align(SV *a, STRLEN size) {
+    STRLEN al;
+    char *ap = SvPV(a, al);
+    if (((IV)ap) & (size - 1))
+	SvOOK_off(ap);
+    if ((((IV)ap) | al) & (size - 1))
+	croak("unaligned packed string (pv offset: %p, pv size: %ld, "
+	      "required alignment: %ld)", ap, (long)al, (long)size);
+}
 
 MODULE = Math::Packed		PACKAGE = Math::Packed		
 
 void
-_mp_bitop(packer, a, b, t = NULL)
-    SV *packer
+_mp_bitop(a, b, t = a)
     SV *a
     SV *b
     SV *t
@@ -141,57 +194,61 @@ ALIAS:
     mp_or = BITOP_OR
     mp_xor = BITOP_XOR
     mp_neqv = BITOP_XOR
+    mp_imp = BITOP_IMP
+    mp_pmi = BITOP_PMI
     mp_nand = BITOP_NAND
     mp_nor = BITOP_NOR
     mp_eqv = BITOP_NXOR
     mp_nxor = BITOP_NXOR
+    mp_nimp = BITOP_NIMP
+    mp_npmi = BITOP_NPMI
 CODE:
 {
-    void (*iv_bitop)(IV *, IV *, IV *, IV *);
+    void (*uv_bitop)(UV *, UV *, UV *, UV *);
     void (*char_bitop)(char *, char *, char *, char *);
     STRLEN al, bl, bli;
     char *ap, *bp, *tp, *btop, *btopi;
-
+    UV buffer[64];
     switch (ix) {
     case BITOP_AND:
-        iv_bitop = &iv_and;
+        uv_bitop = &uv_and;
         char_bitop = &char_and;
         break;
     case BITOP_OR:
-        iv_bitop = &iv_or;
+        uv_bitop = &uv_or;
         char_bitop = &char_or;
         break;
     case BITOP_XOR:
-        iv_bitop = &iv_xor;
+        uv_bitop = &uv_xor;
         char_bitop = &char_xor;
         break;
     case BITOP_IMP:
-        iv_bitop = &iv_imp;
+        uv_bitop = &uv_imp;
         char_bitop = &char_imp;
         break;
     case BITOP_PMI:
-        iv_bitop = &iv_pmi;
+        uv_bitop = &uv_pmi;
         char_bitop = &char_pmi;
         break;
 
     case BITOP_NAND:
-        iv_bitop = &iv_and;
+        uv_bitop = &uv_and;
         char_bitop = &char_and;
         break;
     case BITOP_NOR:
-        iv_bitop = &iv_or;
+        uv_bitop = &uv_or;
         char_bitop = &char_or;
         break;
     case BITOP_NXOR:
-        iv_bitop = &iv_xor;
+        uv_bitop = &uv_xor;
         char_bitop = &char_xor;
         break;
     case BITOP_NIMP:
-        iv_bitop = &iv_nimp;
+        uv_bitop = &uv_nimp;
         char_bitop = &char_nimp;
         break;
     case BITOP_NPMI:
-        iv_bitop = &iv_npmi;
+        uv_bitop = &uv_npmi;
         char_bitop = &char_npmi;
         break;
 
@@ -200,15 +257,31 @@ CODE:
     }
 
     al = SvCUR(a);
-    if (!al) return;
+    if (!al) {
+	sv_setpvn(t, "", 0);
+	return;
+    }
     bl = SvCUR(b);
     if (!bl) croak("length of secondary argument is zero");
-    if (!t) t = a;
-    if (t == b && bl < al) b = sv_2mortal(newSVsv(b));
-    tp = make_dest(t, al);
+    tp = make_dest(t, al, t != a && t != b);
     ap = SvPV_nolen(a);
     bp = SvPV_nolen(b);
 
+    if (bl < al) {
+	STRLEN n =  (sizeof(buffer) < al + bl ? sizeof(buffer) : al + bl) / bl;
+	if (n > 1) {
+	    char *p = (char *)buffer;
+	    STRLEN i;
+	    for (i = 0; i < n; i++, p += bl)
+		memcpy(p, bp, bl);
+	    bp = (char *)buffer;
+	    bl *= n;
+	}
+	else if (t == b) {
+	    bp = savepvn(bp, bl);
+	    save_freepv(bp);
+	}
+    }
     if (bl <= al) goto set_top;
 
     while (1) {
@@ -218,20 +291,68 @@ CODE:
             bl = al;
           set_top:
             btop = bp + bl;
-            bli = bl & ~(sizeof(IV) - 1);
+            bli = bl & ~(sizeof(UV) - 1);
             btopi = bp + bli;
         }
-        if (((IV)ap | (IV)bp | (IV)tp) & (sizeof(IV) - 1))
+        if (((UV)ap | (UV)bp | (UV)tp) & (sizeof(UV) - 1))
             (*char_bitop)(ap, bp, tp, btop);
         else {
-            (*iv_bitop)((IV*)ap, (IV*)bp, (IV*)tp, (IV*)btopi);
+            (*uv_bitop)((UV*)ap, (UV*)bp, (UV*)tp, (UV*)btopi);
             if (bli < bl)
                 (*char_bitop)(ap + bli, bp + bli, tp + bli, btop);
         }
         al -= bl;
-        if (!al) return;
         ap += bl;
         tp += bl;
+        if (!al) break;
     }
- }
+    SvPOK_on(t);
+    SvCUR_set(t, al);
+    *tp = '\0';
+}
 
+void
+mp_bvgrep(packer, a, bv, t = a)
+    char packer
+    SV *a
+    SV *bv
+    SV *t
+CODE:
+{
+    STRLEN bvl, al, tl, size, aoff, toff;
+    char *bvp = SvPV(bv, bvl);
+    vtable *vt;
+
+    vt = find_vtable(packer);
+    size = vt->size;
+
+    if (t == bv) {
+	bvp = savepvn(bvp, bl);
+	save_freepv(bvp);
+    }
+    check_alignment(a, size);
+    al = SvCUR(a);
+    tl = ((al / size) > (8 << 3) ? (al / size) >> 3 : 8) * size;
+
+    make_dest(t, tl, t != a);
+    check_alignment(t, size);
+
+    while (1) {
+	char *tp = SvPVX(t);
+	char *ap = SvPV_nolen(a);
+	char *acp = ap + aoff;
+	char *tcp = tp + toff;
+	(*vt->bvgrep)(&acp, bvp, &tcp, ap + al, bvl, tp + tl);
+	aoff = acp - ap;
+	toff = tcp - tp;
+	if (aoff < al) {
+	    tl *= 2;
+	    if (tl > al) tl = al;
+	    SvGROW(t, tl + 1);
+	}
+	else {
+	    
+	    SvCUR_set(
+	}
+    }
+}
